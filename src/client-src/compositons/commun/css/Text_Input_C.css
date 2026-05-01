@@ -1,0 +1,21 @@
+.flex_Parent_Row {
+    display: flex;
+    flex-direction: row;
+}
+
+.flex_1 {
+    flex: 1
+}
+
+.flex_2 {
+    flex: 2
+}
+
+.flex_3 {
+    flex: 3
+}
+
+.CodeMirror {
+    width:100%;
+    font-size: 10px;
+}
