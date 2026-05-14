@@ -1,0 +1,77 @@
+name: AI review (aider via LiteLLM)
+
+# Comenta en cada PR un review estructurado. No modifica código.
+# Usa aider en modo --message para generar feedback consultando los archivos cambiados.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install aider
+        run: pip install aider-chat==0.86.2
+
+      - name: Compute changed files
+        id: diff
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          FILES=$(git diff --name-only "$BASE" "$HEAD" | head -50 | tr '\n' ' ')
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      - name: Run aider review
+        id: review
+        env:
+          OPENAI_API_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          OPENAI_API_BASE: https://litellm.publisheds.dev/v1
+        run: |
+          MSG="Revisá los cambios en este PR. Listá en formato markdown:
+          1. Issues críticos (bugs, regresiones, security)
+          2. Mejoras de calidad sugeridas
+          3. Tests faltantes
+          4. Resumen ejecutivo en 1 línea
+          No modifiques archivos. Solo devolvé el review."
+
+          if [ -z "${{ steps.diff.outputs.files }}" ]; then
+            echo "No changed files to review" > review.md
+          else
+            aider --model dsv4-flash \
+                  --no-auto-commits \
+                  --yes \
+                  --message "$MSG" \
+                  ${{ steps.diff.outputs.files }} > review.md 2>&1 || true
+          fi
+
+          echo "review<<REVIEW_EOF" >> "$GITHUB_OUTPUT"
+          head -200 review.md >> "$GITHUB_OUTPUT"
+          echo "REVIEW_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const review = `${{ steps.review.outputs.review }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## AI review (dsv4-flash via LiteLLM)\n\n${review}\n\n---\n_Generado automáticamente. Para re-correr: comentar \`/ai-review\`._`
+            });
