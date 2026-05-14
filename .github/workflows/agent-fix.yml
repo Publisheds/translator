@@ -1,0 +1,123 @@
+name: Agent fix (aider via LiteLLM)
+
+# Dispara cuando:
+#   - Issue recibe label agent:auto o agent:supervised
+#   - repository_dispatch desde bot-sync (slash /agent fix en coord)
+#   - workflow_dispatch manual
+
+on:
+  issues:
+    types: [labeled]
+  repository_dispatch:
+    types: [agent-fix]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  fix:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'repository_dispatch' ||
+      contains(fromJson('["agent:auto","agent:supervised"]'), github.event.label.name)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PUBLISHEDS_COORD_BOT_APP_ID }}
+          private-key: ${{ secrets.PUBLISHEDS_COORD_BOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install aider
+        run: pip install aider-chat==0.86.2
+
+      - name: Resolve issue number
+        id: num
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "n=${{ github.event.inputs.issue_number }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "n=${{ github.event.client_payload.issue_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "n=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get issue details
+        id: issue
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          NUM=${{ steps.num.outputs.n }}
+          # Escribimos title+body a un archivo. Sin shell expansion = sin backticks ni $ interpretables.
+          gh issue view "$NUM" --json title,body --jq '"# \(.title)\n\n\(.body)\n\n---\nAplicá el cambio mínimo necesario para resolver esto. Agregá tests si corresponde."' > /tmp/issue-msg.txt
+          # Title también a archivo (no shell-expandido) para uso en PR title
+          gh issue view "$NUM" --json title --jq '.title' > /tmp/issue-title.txt
+          # Labels para decidir modelo
+          LABELS=$(gh issue view "$NUM" --json labels --jq '[.labels[].name] | join(",")')
+          MODEL="dsv4-flash"
+          if echo "$LABELS" | grep -q "complexity:med"; then MODEL="qwen3-coder"; fi
+          if echo "$LABELS" | grep -q "complexity:high"; then MODEL="dsv4-pro"; fi
+          {
+            echo "number=$NUM"
+            echo "model=$MODEL"
+          } >> "$GITHUB_OUTPUT"
+          echo "Issue #$NUM | Model: $MODEL | Labels: $LABELS"
+
+      - name: Create branch
+        run: |
+          BRANCH="agent/issue-${{ steps.issue.outputs.number }}-$(date +%s)"
+          git config user.name "publisheds-coord-bot[bot]"
+          git config user.email "publisheds-coord-bot[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Run aider
+        env:
+          OPENAI_API_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          OPENAI_API_BASE: https://litellm.publisheds.dev/v1
+          MODEL: ${{ steps.issue.outputs.model }}
+        run: |
+          aider --model "$MODEL" \
+                --yes \
+                --auto-commits \
+                --commit-prompt "fix: #${{ steps.issue.outputs.number }}" \
+                --message-file /tmp/issue-msg.txt
+
+      - name: Push branch and open PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          # Si aider no hizo commits → no abrimos PR (nada que mergear)
+          if [ -z "$(git log "origin/$DEFAULT_BRANCH..HEAD" --oneline 2>/dev/null)" ]; then
+            echo "Aider did not make commits. Closing run cleanly without PR."
+            exit 0
+          fi
+          git push "https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository }}.git" "$BRANCH"
+          TITLE=$(cat /tmp/issue-title.txt)
+          PR_BODY=$(printf 'Closes #%s\n\n🤖 PR generado por `agent-fix.yml` con aider + `%s` vía LiteLLM (ollama.com primary, DeepSeek fallback).\n\nEsperá AI review automático en este PR.' "${{ steps.issue.outputs.number }}" "${{ steps.issue.outputs.model }}")
+          gh pr create \
+            --title "fix: $TITLE" \
+            --body "$PR_BODY" \
+            --head "$BRANCH" \
+            --base "$DEFAULT_BRANCH"
