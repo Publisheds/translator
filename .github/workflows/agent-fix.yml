@@ -97,7 +97,9 @@ jobs:
           OPENAI_API_BASE: https://litellm.publisheds.dev/v1
           MODEL: ${{ steps.issue.outputs.model }}
         run: |
-          aider --model "$MODEL" \
+          # Prefix openai/ → aider usa cliente OpenAI-compatible contra LiteLLM proxy
+          # (sin prefix, aider invoca librería LiteLLM directa que pide "provider/")
+          aider --model "openai/$MODEL" \
                 --yes \
                 --auto-commits \
                 --commit-prompt "fix: #${{ steps.issue.outputs.number }}" \
