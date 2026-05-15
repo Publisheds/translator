@@ -22,6 +22,12 @@ permissions:
   pull-requests: write
   issues: write
 
+# Evita N runs concurrentes sobre el mismo issue (cuando el bot añade varias
+# labels seguidas, GitHub dispara un evento `labeled` por cada una).
+concurrency:
+  group: agent-fix-${{ github.event.issue.number || github.event.client_payload.issue_number || github.event.inputs.issue_number }}
+  cancel-in-progress: false
+
 jobs:
   fix:
     if: |
@@ -68,58 +74,114 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           NUM=${{ steps.num.outputs.n }}
-          # Escribimos title+body a un archivo. Sin shell expansion = sin backticks ni $ interpretables.
-          gh issue view "$NUM" --json title,body --jq '"# \(.title)\n\n\(.body)\n\n---\nAplicá el cambio mínimo necesario para resolver esto. Agregá tests si corresponde."' > /tmp/issue-msg.txt
-          # Title también a archivo (no shell-expandido) para uso en PR title
+          # Title + body al filesystem (sin shell expansion = sin backticks ni $ interpretables).
+          gh issue view "$NUM" --json title,body --jq '"# \(.title)\n\n\(.body)\n\n---\nAplica el cambio mínimo necesario para resolver esto. Añade tests si corresponde."' > /tmp/issue-msg.txt
           gh issue view "$NUM" --json title --jq '.title' > /tmp/issue-title.txt
+          gh issue view "$NUM" --json body --jq '.body'  > /tmp/issue-body.txt
           # Labels para decidir modelo
           LABELS=$(gh issue view "$NUM" --json labels --jq '[.labels[].name] | join(",")')
           MODEL="dsv4-flash"
-          if echo "$LABELS" | grep -q "complexity:med"; then MODEL="qwen3-coder"; fi
-          if echo "$LABELS" | grep -q "complexity:high"; then MODEL="dsv4-pro"; fi
+          if echo "$LABELS" | grep -q "complexity:med";  then MODEL="qwen3-coder"; fi
+          if echo "$LABELS" | grep -q "complexity:high"; then MODEL="dsv4-pro";    fi
           {
             echo "number=$NUM"
             echo "model=$MODEL"
           } >> "$GITHUB_OUTPUT"
           echo "Issue #$NUM | Model: $MODEL | Labels: $LABELS"
 
+      # ─── Extrae los archivos sugeridos del body del issue ────────────────
+      # El Planner LLM genera issues con una sección "## Archivos sugeridos"
+      # listando paths en backticks. Sin esto, aider entra en modo "discovery"
+      # y le pide al humano que añada archivos al chat → no aplica cambios →
+      # no abre PR (bug detectado en smoke test del 2026-05-15).
+      - name: Extract suggested files
+        id: files
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          # 1) Paths en backticks: `path/to/file.ext`
+          # 2) Filtra los que parecen archivos reales (tienen / o terminan en .ext)
+          # 3) Quita prefix `<repo>/` si está (p. ej. "backend/StatBridge/..." → "StatBridge/...")
+          # 4) Quita líneas/coordenadas tipo " (línea 48-49)" en el path
+          # 5) Dedup
+          # 6) Verifica que el archivo exista en el checkout (sino se descarta)
+          grep -oE '`[^`]+`' /tmp/issue-body.txt 2>/dev/null \
+            | sed 's/^`//;s/`$//' \
+            | grep -E '\.[a-zA-Z0-9]{1,8}$|/' \
+            | sed -E "s|^${REPO_NAME}/||" \
+            | sort -u > /tmp/issue-files-raw.txt || true
+
+          : > /tmp/issue-files.txt
+          while IFS= read -r f; do
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              echo "$f" >> /tmp/issue-files.txt
+            fi
+          done < /tmp/issue-files-raw.txt
+
+          COUNT=$(wc -l < /tmp/issue-files.txt | tr -d ' ')
+          FILES=$(tr '\n' ' ' < /tmp/issue-files.txt)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "files=$FILES"  >> "$GITHUB_OUTPUT"
+          echo "Suggested files ($COUNT): $FILES"
+
       - name: Create branch
         run: |
           BRANCH="agent/issue-${{ steps.issue.outputs.number }}-$(date +%s)"
-          git config user.name "publisheds-coord-bot[bot]"
+          git config user.name  "publisheds-coord-bot[bot]"
           git config user.email "publisheds-coord-bot[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
           echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
 
       - name: Run aider
         env:
-          OPENAI_API_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          OPENAI_API_KEY:  ${{ secrets.LITELLM_MASTER_KEY }}
           OPENAI_API_BASE: https://litellm.publisheds.dev/v1
-          MODEL: ${{ steps.issue.outputs.model }}
+          MODEL:           ${{ steps.issue.outputs.model }}
+          FILES:           ${{ steps.files.outputs.files }}
         run: |
-          # Prefix openai/ → aider usa cliente OpenAI-compatible contra LiteLLM proxy
-          # (sin prefix, aider invoca librería LiteLLM directa que pide "provider/")
-          aider --model "openai/$MODEL" \
-                --yes \
-                --auto-commits \
-                --commit-prompt "fix: #${{ steps.issue.outputs.number }}" \
-                --message-file /tmp/issue-msg.txt
+          # Prefix openai/ → aider usa cliente OpenAI-compatible contra LiteLLM proxy.
+          # --yes-always: non-interactive total, autoconfirma todos los prompts.
+          # Si el issue body listó archivos sugeridos, los pasamos como args
+          # posicionales (equivalente a --file pero compatible con múltiples).
+          # Si no los listó, dejamos que aider use su repo-map (más lento, peor
+          # calidad, pero al menos intenta algo).
+          if [ -n "$FILES" ]; then
+            echo "▸ Pasando $(echo $FILES | wc -w) archivos sugeridos a aider"
+            aider --model "openai/$MODEL" \
+                  --yes-always \
+                  --no-show-model-warnings \
+                  --auto-commits \
+                  --commit-prompt "fix: #${{ steps.issue.outputs.number }}" \
+                  --message-file /tmp/issue-msg.txt \
+                  $FILES
+          else
+            echo "▸ Sin archivos en el issue body — aider hace discovery (calidad reducida)"
+            aider --model "openai/$MODEL" \
+                  --yes-always \
+                  --no-show-model-warnings \
+                  --map-tokens 2048 \
+                  --auto-commits \
+                  --commit-prompt "fix: #${{ steps.issue.outputs.number }}" \
+                  --message-file /tmp/issue-msg.txt
+          fi
 
       - name: Push branch and open PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-          # Si aider no hizo commits → no abrimos PR (nada que mergear)
+          # Si aider no hizo commits → no abrimos PR (nada que mezclar)
           if [ -z "$(git log "origin/$DEFAULT_BRANCH..HEAD" --oneline 2>/dev/null)" ]; then
             echo "Aider did not make commits. Closing run cleanly without PR."
+            # Comentar en el issue para que el humano sepa que no hubo cambios
+            gh issue comment "${{ steps.issue.outputs.number }}" --body \
+              "🤖 aider corrió pero no aplicó cambios. Posibles causas: el archivo ya está en el estado deseado, el LLM no entendió el cambio, o faltan archivos en el bloque \`## Archivos sugeridos\` del issue. Revisar logs de [esta run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
             exit 0
           fi
           git push "https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository }}.git" "$BRANCH"
           TITLE=$(cat /tmp/issue-title.txt)
-          PR_BODY=$(printf 'Closes #%s\n\n🤖 PR generado por `agent-fix.yml` con aider + `%s` vía LiteLLM (ollama.com primary, DeepSeek fallback).\n\nEsperá AI review automático en este PR.' "${{ steps.issue.outputs.number }}" "${{ steps.issue.outputs.model }}")
+          PR_BODY=$(printf 'Closes #%s\n\n🤖 PR generado por `agent-fix.yml` con aider + `%s` vía LiteLLM (ollama.com primary, DeepSeek fallback).\n\nEspera el AI review automático en este PR.' "${{ steps.issue.outputs.number }}" "${{ steps.issue.outputs.model }}")
           gh pr create \
             --title "fix: $TITLE" \
-            --body "$PR_BODY" \
-            --head "$BRANCH" \
-            --base "$DEFAULT_BRANCH"
+            --body  "$PR_BODY" \
+            --head  "$BRANCH" \
+            --base  "$DEFAULT_BRANCH"
