@@ -75,9 +75,17 @@ jobs:
         run: |
           NUM=${{ steps.num.outputs.n }}
           # Title + body al filesystem (sin shell expansion = sin backticks ni $ interpretables).
-          gh issue view "$NUM" --json title,body --jq '"# \(.title)\n\n\(.body)\n\n---\nAplica el cambio mínimo necesario para resolver esto. Añade tests si corresponde."' > /tmp/issue-msg.txt
-          gh issue view "$NUM" --json title --jq '.title' > /tmp/issue-title.txt
-          gh issue view "$NUM" --json body --jq '.body'  > /tmp/issue-body.txt
+          # IMPORTANTE: --template '{{.x}}' devuelve raw text (newlines reales).
+          # --jq '.x' por defecto emite JSON-quoted (con \n literal) y rompe el parser.
+          gh issue view "$NUM" --json title,body --template '# {{.title}}
+
+{{.body}}
+
+---
+Aplica el cambio mínimo necesario para resolver esto. Añade tests si corresponde.
+' > /tmp/issue-msg.txt
+          gh issue view "$NUM" --json title --template '{{.title}}' > /tmp/issue-title.txt
+          gh issue view "$NUM" --json body  --template '{{.body}}'  > /tmp/issue-body.txt
           # Labels para decidir modelo
           LABELS=$(gh issue view "$NUM" --json labels --jq '[.labels[].name] | join(",")')
           MODEL="dsv4-flash"
