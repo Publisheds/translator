@@ -43,12 +43,12 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
           OPENAI_API_BASE: https://litellm.publisheds.dev/v1
         run: |
-          MSG="Revisá los cambios en este PR. Listá en formato markdown:
+          MSG="Revisa los cambios en este PR. Lista en formato markdown:
           1. Issues críticos (bugs, regresiones, security)
           2. Mejoras de calidad sugeridas
           3. Tests faltantes
           4. Resumen ejecutivo en 1 línea
-          No modifiques archivos. Solo devolvé el review."
+          No modifiques archivos. Solo devuelve el review."
 
           if [ -z "${{ steps.diff.outputs.files }}" ]; then
             echo "No changed files to review" > review.md
