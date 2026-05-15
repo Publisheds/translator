@@ -74,11 +74,11 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           NUM=${{ steps.num.outputs.n }}
-          # Title + body al filesystem (sin shell expansion = sin backticks ni $ interpretables).
-          # IMPORTANTE: --template '{{.x}}' devuelve raw text (newlines reales).
-          # --jq '.x' por defecto emite JSON-quoted (con \n literal) y rompe el parser.
-          gh issue view "$NUM" --json title --template '{{.title}}' > /tmp/issue-title.txt
-          gh issue view "$NUM" --json body  --template '{{.body}}'  > /tmp/issue-body.txt
+          # Una sola llamada a la API que trae title+body+labels en JSON.
+          # jq -r unwrapping para obtener strings raw (no JSON-quoted).
+          gh api "repos/${GITHUB_REPOSITORY}/issues/$NUM" > /tmp/issue.json
+          jq -r '.title' < /tmp/issue.json > /tmp/issue-title.txt
+          jq -r '.body'  < /tmp/issue.json > /tmp/issue-body.txt
           {
             printf '# '
             cat /tmp/issue-title.txt
@@ -86,8 +86,18 @@ jobs:
             cat /tmp/issue-body.txt
             printf '\n\n---\nAplica el cambio mínimo necesario para resolver esto. Añade tests si corresponde.\n'
           } > /tmp/issue-msg.txt
+          # Debug visible para diagnosticar:
+          echo "=== /tmp/issue-title.txt ($(wc -c < /tmp/issue-title.txt) bytes) ==="
+          cat /tmp/issue-title.txt
+          echo
+          echo "=== /tmp/issue-body.txt ($(wc -c < /tmp/issue-body.txt) bytes) ==="
+          cat /tmp/issue-body.txt
+          echo
+          echo "=== /tmp/issue-msg.txt ($(wc -c < /tmp/issue-msg.txt) bytes) ==="
+          head -c 1000 /tmp/issue-msg.txt
+          echo
           # Labels para decidir modelo
-          LABELS=$(gh issue view "$NUM" --json labels --jq '[.labels[].name] | join(",")')
+          LABELS=$(jq -r '[.labels[].name] | join(",")' < /tmp/issue.json)
           MODEL="dsv4-flash"
           if echo "$LABELS" | grep -q "complexity:med";  then MODEL="qwen3-coder"; fi
           if echo "$LABELS" | grep -q "complexity:high"; then MODEL="dsv4-pro";    fi
@@ -104,32 +114,57 @@ jobs:
       # no abre PR (bug detectado en smoke test del 2026-05-15).
       - name: Extract suggested files
         id: files
+        shell: python
         run: |
-          REPO_NAME="${GITHUB_REPOSITORY##*/}"
-          # 1) Paths en backticks: `path/to/file.ext`
-          # 2) Filtra los que parecen archivos reales (tienen / o terminan en .ext)
-          # 3) Quita prefix `<repo>/` si está (p. ej. "backend/StatBridge/..." → "StatBridge/...")
-          # 4) Quita líneas/coordenadas tipo " (línea 48-49)" en el path
-          # 5) Dedup
-          # 6) Verifica que el archivo exista en el checkout (sino se descarta)
-          grep -oE '`[^`]+`' /tmp/issue-body.txt 2>/dev/null \
-            | sed 's/^`//;s/`$//' \
-            | grep -E '\.[a-zA-Z0-9]{1,8}$|/' \
-            | sed -E "s|^${REPO_NAME}/||" \
-            | sort -u > /tmp/issue-files-raw.txt || true
+          # Parser en Python nativo (bash heredoc rompe por indentación YAML).
+          import os, re, pathlib
 
-          : > /tmp/issue-files.txt
-          while IFS= read -r f; do
-            if [ -n "$f" ] && [ -f "$f" ]; then
-              echo "$f" >> /tmp/issue-files.txt
-            fi
-          done < /tmp/issue-files-raw.txt
+          body = open('/tmp/issue-body.txt', encoding='utf-8').read()
+          repo = os.environ['GITHUB_REPOSITORY'].split('/')[-1]
 
-          COUNT=$(wc -l < /tmp/issue-files.txt | tr -d ' ')
-          FILES=$(tr '\n' ' ' < /tmp/issue-files.txt)
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "files=$FILES"  >> "$GITHUB_OUTPUT"
-          echo "Suggested files ($COUNT): $FILES"
+          # Paths en backticks ASCII (0x60).
+          candidates = re.findall(r'`([^`]+)`', body)
+
+          # Filter: tiene / o extensión tipo .py / .ts / .tsx / etc.
+          def looks_like_file(p):
+              return '/' in p or bool(re.search(r'\.[a-zA-Z0-9]{1,8}$', p))
+          candidates = [c for c in candidates if looks_like_file(c)]
+
+          # Strip prefix de repo si está
+          def strip_repo(p):
+              return p[len(repo)+1:] if p.startswith(repo + '/') else p
+          candidates = [strip_repo(c) for c in candidates]
+
+          # Strip basura típica
+          candidates = [re.sub(r'\s*\(.*\)\s*$', '', c) for c in candidates]
+          candidates = [c.split('#')[0] for c in candidates]
+          candidates = [c.strip() for c in candidates if c.strip()]
+
+          # Dedup preservando orden
+          seen = set()
+          uniq = []
+          for c in candidates:
+              if c not in seen:
+                  seen.add(c)
+                  uniq.append(c)
+
+          # Verificar existencia en el checkout
+          final = [c for c in uniq if pathlib.Path(c).is_file()]
+
+          # Debug
+          print(f"Candidatos en backticks: {len(re.findall(r'`([^`]+)`', body))}")
+          print(f"Tras filtros: {len(uniq)}")
+          print(f"Existentes en checkout: {len(final)}")
+          for c in uniq:
+              print(f"  - {c}  ({'exists' if pathlib.Path(c).is_file() else 'MISSING'})")
+
+          # Outputs
+          with open('/tmp/issue-files.txt', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(final))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'count={len(final)}\n')
+              f.write(f'files={" ".join(final)}\n')
+          print(f"Suggested files ({len(final)}): {' '.join(final)}")
 
       - name: Create branch
         run: |
@@ -172,24 +207,101 @@ jobs:
                   --message-file /tmp/issue-msg.txt
           fi
 
-      - name: Push branch and open PR
+      - name: Push branch and open PR (via REST API)
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          BRANCH:        ${{ env.BRANCH }}
+          ISSUE_NUM:     ${{ steps.issue.outputs.number }}
+          MODEL:         ${{ steps.issue.outputs.model }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID:     ${{ github.run_id }}
+        shell: python
         run: |
-          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-          # Si aider no hizo commits → no abrimos PR (nada que mezclar)
-          if [ -z "$(git log "origin/$DEFAULT_BRANCH..HEAD" --oneline 2>/dev/null)" ]; then
-            echo "Aider did not make commits. Closing run cleanly without PR."
-            # Comentar en el issue para que el humano sepa que no hubo cambios
-            gh issue comment "${{ steps.issue.outputs.number }}" --body \
-              "🤖 aider corrió pero no aplicó cambios. Posibles causas: el archivo ya está en el estado deseado, el LLM no entendió el cambio, o faltan archivos en el bloque \`## Archivos sugeridos\` del issue. Revisar logs de [esta run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
-            exit 0
-          fi
-          git push "https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository }}.git" "$BRANCH"
-          TITLE=$(cat /tmp/issue-title.txt)
-          PR_BODY=$(printf 'Closes #%s\n\n🤖 PR generado por `agent-fix.yml` con aider + `%s` vía LiteLLM (ollama.com primary, DeepSeek fallback).\n\nEspera el AI review automático en este PR.' "${{ steps.issue.outputs.number }}" "${{ steps.issue.outputs.model }}")
-          gh pr create \
-            --title "fix: $TITLE" \
-            --body  "$PR_BODY" \
-            --head  "$BRANCH" \
-            --base  "$DEFAULT_BRANCH"
+          # Approach API-only: en vez de git push (que tiene problemas raros
+          # con tokens en GH Actions), usamos gh api para crear la branch ref
+          # + commits con PUT /contents, y luego gh pr create.
+          import os, subprocess, base64, json, sys
+
+          REPO = os.environ['GITHUB_REPOSITORY']
+          BRANCH = os.environ['BRANCH']
+          DEFAULT_BRANCH = subprocess.run(
+              ['gh', 'api', f'repos/{REPO}', '--jq', '.default_branch'],
+              capture_output=True, text=True, check=True
+          ).stdout.strip()
+          ISSUE_NUM = os.environ['ISSUE_NUM']
+          MODEL = os.environ['MODEL']
+
+          # ¿aider hizo commits?
+          local_commits = subprocess.run(
+              ['git', 'log', f'origin/{DEFAULT_BRANCH}..HEAD', '--oneline'],
+              capture_output=True, text=True
+          ).stdout.strip()
+          if not local_commits:
+              print("Aider did not make commits. Closing run cleanly without PR.")
+              subprocess.run([
+                  'gh', 'issue', 'comment', ISSUE_NUM,
+                  '--body',
+                  f'🤖 aider corrió pero no aplicó cambios. Posibles causas: el archivo ya está en el estado deseado, el LLM no entendió el cambio, o faltan archivos en `## Archivos sugeridos`. Logs: {os.environ["GH_SERVER_URL"]}/{REPO}/actions/runs/{os.environ["GH_RUN_ID"]}.'
+              ])
+              sys.exit(0)
+
+          # Crear la branch ref en remoto, basada en el SHA de origin/main
+          main_sha = subprocess.run(
+              ['git', 'rev-parse', f'origin/{DEFAULT_BRANCH}'],
+              capture_output=True, text=True, check=True
+          ).stdout.strip()
+          subprocess.run([
+              'gh', 'api', f'repos/{REPO}/git/refs', '-X', 'POST',
+              '-f', f'ref=refs/heads/{BRANCH}',
+              '-f', f'sha={main_sha}'
+          ], check=True)
+          print(f"✓ Branch {BRANCH} creada en remoto desde {main_sha[:8]}")
+
+          # Archivos modificados por aider
+          changed = subprocess.run(
+              ['git', 'diff', '--name-only', f'origin/{DEFAULT_BRANCH}..HEAD'],
+              capture_output=True, text=True, check=True
+          ).stdout.strip().split('\n')
+          print(f"✓ Archivos modificados: {len(changed)}")
+
+          # Commit cada archivo modificado via PUT /contents
+          for f in changed:
+              if not f or not os.path.exists(f): continue
+              with open(f, 'rb') as fh:
+                  content_b64 = base64.b64encode(fh.read()).decode()
+              # SHA actual del archivo en la branch (necesario para update)
+              sha_check = subprocess.run(
+                  ['gh', 'api', f'repos/{REPO}/contents/{f}?ref={BRANCH}', '--jq', '.sha'],
+                  capture_output=True, text=True
+              )
+              args = [
+                  'gh', 'api', f'repos/{REPO}/contents/{f}', '-X', 'PUT',
+                  '-f', f'message=fix: #{ISSUE_NUM} — {f}',
+                  '-f', f'content={content_b64}',
+                  '-f', f'branch={BRANCH}',
+              ]
+              if sha_check.returncode == 0 and sha_check.stdout.strip():
+                  args += ['-f', f'sha={sha_check.stdout.strip()}']
+              subprocess.run(args, check=True, capture_output=True)
+              print(f"  ✓ {f}")
+
+          # Crear PR
+          with open('/tmp/issue-title.txt') as fh:
+              title = fh.read().strip()
+          pr_body = (
+              f'Closes #{ISSUE_NUM}\n\n'
+              f'🤖 PR generado por `agent-fix.yml` con aider + `{MODEL}` vía LiteLLM '
+              f'(ollama.com primary, DeepSeek fallback).\n\n'
+              f'Espera el AI review automático en este PR.'
+          )
+          result = subprocess.run([
+              'gh', 'pr', 'create',
+              '--title', f'fix: {title}',
+              '--body', pr_body,
+              '--head', BRANCH,
+              '--base', DEFAULT_BRANCH,
+          ], capture_output=True, text=True)
+          print(result.stdout)
+          if result.returncode != 0:
+              print(f"gh pr create stderr: {result.stderr}", file=sys.stderr)
+              sys.exit(1)
